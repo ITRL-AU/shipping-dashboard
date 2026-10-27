@@ -12,6 +12,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 
+<script src="container-tracking.js"></script>
 <style>
 :root{
   color-scheme: light;
@@ -98,7 +99,16 @@ button{font:inherit;color:inherit}
 /* Shipment type filter: header buttons + sidebar dropdown */
 .type-btns{display:flex;gap:6px;flex-wrap:wrap}
 .btn[aria-pressed="true"]{background:color-mix(in srgb,var(--accent) 16%,var(--surface));border-color:var(--accent);font-weight:600}
-.type-sel{font:inherit;font-size:13px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px 6px;max-width:100%}
+.type-sel,.fld{font:inherit;font-size:13px;color:var(--text);background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:4px 6px;max-width:100%}
+/* Booking & container tracking card */
+.card h4{margin:10px 0 4px;font-size:12.5px;color:var(--text-2)}
+.ev-form{display:grid;grid-template-columns:1fr 1fr;gap:6px 8px;margin-top:8px}
+.ev-form label{display:grid;gap:2px;font-size:12px;color:var(--text-2);min-width:0}
+.ev-form .wide{grid-column:1 / -1}
+.ev-form .actions{margin:2px 0 0}
+.ref{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:1px 0 3px}
+.lookup{font-size:12px;margin:-1px 0 5px}
+.small-x{width:18px;height:18px;font-size:14px;vertical-align:middle}
 .sb-filter{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--border);font-size:13px;color:var(--text-2)}
 .sb-filter .type-sel{flex:1}
 #sidebar.collapsed .sb-filter{display:none}
@@ -285,6 +295,7 @@ dialog::backdrop{background:rgba(0,0,0,.35)}
   <div class="meta" id="meta"></div>
   <span class="ais-status" id="aisStatus" aria-live="polite" data-edit></span>
   <button class="btn" id="aisBtn" data-action="ais-refresh" data-edit title="Pull live ship positions from AISStream (up to 10 min; positions appear as ships report)">Refresh positions</button>
+  <button class="btn" id="ctrBtn" data-action="ctr-refresh" data-edit title="Ask Claude to look up the containers on the carriers' tracking pages">Refresh containers</button>
   <button class="btn primary" data-action="import" data-edit title="Import a supplier PROJECT DETAILS file (.xlsx) or a dashboard backup (.json)">Import file</button>
   <button class="btn" data-action="export" data-edit title="Save all shipments, archive and history to a .json backup file">Export backup</button>
   <button class="btn" id="publishBtn" data-action="publish" data-edit hidden title="Encrypt everything with the team password and publish it to the team's GitHub Pages link">Publish team view</button>
@@ -395,6 +406,8 @@ const COLUMNS = [
   ['cargoAvailable','Cargo available',['CARGO AVAILABLE'],'date'],
   ['podFreeDays','POD free days',['POD FREE DAYS']],
   ['bookingConfirmed','Booking confirmed',['BOOKING CONFIRMED']],
+  ['bookingRef','Booking ref',['BOOKING REF','BOOKING REFERENCE','BOOKING NO','BOOKING NUMBER','BOOKING','BKG REF','BKG NO']],
+  ['containers','Container no.',['CONTAINER NO','CONTAINER NOS','CONTAINER NUMBER','CONTAINER NUMBERS','CONTAINER','CONTAINERS','CNTR NO','CNTR']],
   ['method','Method',['METHOD','MODE']],
   ['volume','Volume',['VOLUME']],
   ['pol','POL',['POL']],
@@ -470,6 +483,50 @@ const typeFromText = v => /stock/i.test(v) ? 'stock' : /product/i.test(v) ? 'pro
 const shipType = s => typeFromText(s.fields.shipType || '') || s.type || null;
 const typeOptions = (sel, none) => `<option value="">${none}</option>` +
   Object.entries(TYPES).map(([k, t]) => `<option value="${k}"${k === sel ? ' selected' : ''}>${t.label}</option>`).join('');
+
+// Booking refs and container numbers: from the supplier file, unless edited in the dashboard (s.refs).
+const CONTAINER_RE = /\b[A-Z]{4}\s?\d{6}-?\d\b/g; // ISO 6346, e.g. OOLU1234567 or OOLU 123456-7
+const splitRefs = v => String(v || '').split(/[,;\/\n]+/).map(x => x.trim()).filter(x => x && !blank(x));
+function refsOf(s){
+  const e = s.refs || {}, raw = String((e.containers ?? s.fields.containers) || '').toUpperCase();
+  const iso = (raw.match(CONTAINER_RE) || []).map(c => c.replace(/[\s-]/g, ''));
+  return {booking: splitRefs(e.booking ?? s.fields.bookingRef), containers: iso.length ? iso : splitRefs(raw).filter(x => !/^(LCL|FCL)$/.test(x)), edited: !!s.refs};
+}
+// Carrier tracking pages: "Copy & open" copies the number and opens the page (nothing is put in the link or sent by the dashboard).
+const CARRIER_TRACK = [[/OOCL/i, 'OOCL', 'https://www.oocl.com/eng/ourservices/eservices/cargotracking/Pages/cargotracking.aspx'],
+  [/COSCO/i, 'COSCO', 'https://elines.coscoshipping.com/ebusiness/cargoTracking'], [/CARO\s*TRANS/i, 'CaroTrans', 'https://www.carotrans.com/']];
+function trackSite(d){
+  const hit = CARRIER_TRACK.find(([re]) => re.test(d.f.carrier || '')) || CARRIER_TRACK.find(([re]) => re.test(d.vehicle || ''));
+  return hit ? {name:hit[1], url:hit[2]} : {name:'track-trace.com', url:'https://www.track-trace.com/container'};
+}
+// Container events, logged by hand for now (src 'manual'; a tracking-service API can add src 'api' events later).
+// stage: the status the event means; still: the container is at the event's place (so it can place the marker).
+const EVENTS = {
+  'gate-in':{label:'Gate in at origin terminal', stage:'pending', still:true},
+  loaded:{label:'Loaded on vessel', stage:'pending', still:true},
+  departed:{label:'Vessel departed', stage:'transit'},
+  'ts-discharged':{label:'Transshipment: discharged', stage:'transit', still:true},
+  'ts-departed':{label:'Transshipment: departed', stage:'transit'},
+  arrived:{label:'Vessel arrived at destination port', stage:'arrived', still:true},
+  discharged:{label:'Discharged at destination port', stage:'arrived', still:true},
+  released:{label:'Customs released', stage:'arrived', still:true},
+  'gate-out':{label:'Gate out for delivery', stage:'delivery'},
+  delivered:{label:'Delivered to site', stage:'delivered'},
+  'empty-returned':{label:'Empty container returned', stage:'delivered'},
+};
+// Container events: logged here (s.events) plus those Claude looked up on carrier sites (container-tracking.js, keyed by container).
+const lookupOf = c => ((window.CONTAINER_TRACKING && window.CONTAINER_TRACKING.containers) || {})[c] || null;
+function eventsOf(s, containers){
+  const looked = (containers || []).flatMap(c => { const l = lookupOf(c);
+    return l ? (l.events || []).map(e => ({...e, container:c, src:'lookup', logged:l.checkedAt, eta:''})) : []; });
+  return (s.events || []).concat(looked).filter(e => EVENTS[e.type] && !isNaN(Date.parse(e.at))).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+}
+// When the supplier file last reported on this shipment: its report date, else the import time.
+const fileTime = s => Date.parse(s.lastReport || s.lastSeen || s.firstSeen || 0);
+const isoDay = ms => new Date(ms).toISOString().slice(0, 10);
+// An event's place as typed, or "Busan (KRPUS)" when it's a known port.
+const placeName = p => { const l = resolveLoc(p); return l && !l.unknown ? `${l.name} (${l.code})` : String(p || ''); };
+const SRC_LABEL = {supplier:'supplier file', ais:'AIS', carrier:'carrier', lookup:'carrier lookup'};
 
 const ICON = {
   sea:'<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 14.5h17l-2.3 4.6a1.6 1.6 0 0 1-1.4.9H7.2a1.6 1.6 0 0 1-1.4-.9zM6 13V9.2c0-.6.5-1.2 1.2-1.2H11V4.5h3V8h2.8c.7 0 1.2.6 1.2 1.2V13z"/></svg>',
@@ -637,6 +694,7 @@ function save(){
   if (TEAM) return;
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); storageOK = true; }
   catch (e) { storageOK = false; }
+  postContainerList();
   document.getElementById('storageBanner').hidden = storageOK;
 }
 
@@ -702,16 +760,30 @@ function derive(s){
   }
 
   let dep = isoMs(f.etd), arr = isoMs(f.eta), timeSrc = 'schedule';
-  if (vessel && vessel.onVoyage && vessel.atd){ dep = Date.parse(vessel.atd); arr = vessel.eta ? Date.parse(vessel.eta) : arr; timeSrc = 'ais'; }
+  if (vessel && vessel.onVoyage && vessel.atd){ dep = Date.parse(vessel.atd); timeSrc = 'ais'; }
+
+  // Newest wins (user, 2026-10-26): supplier file vs AIS vs container events, by when each source last reported.
+  const refs = refsOf(s), events = eventsOf(s, refs.containers), ev = events[events.length - 1], evT = ev ? Date.parse(ev.at) : -Infinity, fileT = fileTime(s);
+  const departed = events.find(e => e.type === 'departed');
+  if (departed){ dep = Date.parse(departed.at); timeSrc = 'event'; } // an actual departure beats the plan
+  // ETA: whichever of supplier, AIS and carrier ETA was updated most recently.
+  const etas = [{src:'supplier', eta:arr, at:fileT}];
+  if (vessel && vessel.onVoyage && vessel.eta && window.VESSEL_TRACKING) etas.push({src:'ais', eta:Date.parse(vessel.eta), at:Date.parse(window.VESSEL_TRACKING.checkedAt)});
+  for (const e of events) if (isISO(e.eta)) etas.push({src:'carrier', eta:isoMs(e.eta), at:Date.parse(e.logged || e.at)});
+  for (const c of refs.containers){ const l = lookupOf(c); if (l && isISO(l.eta)) etas.push({src:'lookup', eta:isoMs(l.eta), at:Date.parse(l.checkedAt)}); }
+  const etaPick = etas.filter(x => x.eta != null && !isNaN(x.eta)).sort((a, b) => b.at - a.at)[0];
+  if (etaPick) arr = etaPick.eta;
 
   const t = now(), unconfirmed = !/^Y/i.test(String(f.bookingConfirmed || '').trim());
-  let stage;
+  let stage, stageSrc = 'dates';
   if (isISO(f.actualAtSite) && isoMs(f.actualAtSite) <= t) stage = 'delivered';
   else if (!vehicle || dep == null) stage = 'unbooked';
   else if (t < dep) stage = unconfirmed ? 'allocated' : 'pending';
   else if (arr == null || t < arr) stage = 'transit';
   else if (isISO(f.cargoAvailable) && isoMs(f.cargoAvailable) <= t) stage = 'delivery';
   else stage = 'arrived';
+  // A container event newer than the supplier file sets the status (the file's actual date at site still wins).
+  if (ev && evT > fileT && stage !== 'delivered'){ stage = EVENTS[ev.type].stage; stageSrc = 'event'; }
   const atPod = stage === 'arrived' || stage === 'delivery' || stage === 'delivered';
   const progress = (dep != null && arr != null && arr > dep) ? clamp((t - dep) / (arr - dep), 0, 1) : (atPod ? 1 : 0);
 
@@ -732,9 +804,15 @@ function derive(s){
       let lng = vessel.lng; while (lng - route[0][1] > 180) lng -= 360; while (lng - route[0][1] < -180) lng += 360;
       pos = [vessel.lat, lng]; posKind = 'ais'; split = nearestOnRoute(route, pos);
     }
-    else if (stage === 'transit'){ const p = pointAt(route, progress); pos = p.pt; posKind = timeSrc === 'ais' ? 'est-ais' : 'est-schedule'; split = p; }
+    else if (stage === 'transit'){ const p = pointAt(route, progress); pos = p.pt; posKind = timeSrc === 'ais' ? 'est-ais' : timeSrc === 'event' ? 'est-event' : 'est-schedule'; split = p; }
     else if (atPod){ pos = route[route.length-1]; posKind = 'pod'; }
     else { pos = route[0]; posKind = 'pol'; }
+    // A container event at a known port, newer than the last AIS fix, puts the marker there (e.g. a transshipment port).
+    const evLoc = stageSrc === 'event' && EVENTS[ev.type].still ? resolveLoc(ev.place) : null;
+    if (evLoc && !evLoc.unknown && evT > (aisOk ? Date.parse(vessel.positionTime) : -Infinity)){
+      let lng = evLoc.lng; while (lng - route[0][1] > 180) lng -= 360; while (lng - route[0][1] < -180) lng += 360;
+      pos = [evLoc.lat, lng]; posKind = 'event'; split = nearestOnRoute(route, pos);
+    }
   } else if (pol && !pol.unknown){ pos = [pol.lat, pol.lng]; posKind = 'pol'; }
 
   const dates = dateChanges(s), delayDays = Math.max(0, ...Object.values(dates).map(c => c.days));
@@ -743,7 +821,8 @@ function derive(s){
   // Status = the stage, except "Delayed" takes over while a date was pushed back or the shipment is overdue (until delivered).
   const status = stage !== 'delivered' && (delayDays > 0 || overdueDays > 0) ? 'delayed' : stage;
   return {s, key:s.key, f, mode, pol, pod, vehicle, vessel, dep, arr, timeSrc, stage, status, progress, route, routeKind, pos, posKind, split,
-    projectNo:projectNo(s), projectName:f.project || '', type:shipType(s), unconfirmed, dates, delayDays, overdueDays};
+    projectNo:projectNo(s), projectName:f.project || '', type:shipType(s), unconfirmed, dates, delayDays, overdueDays,
+    refs, events, lastEvent:ev, stageSrc, fileT, eta:etaPick || null};
 }
 
 // ---------- Import ----------
@@ -793,7 +872,7 @@ function diff(ex, row){
 }
 
 function merge(parsed, file){
-  const at = new Date().toISOString();
+  const at = new Date().toISOString(), reportAt = parsed.reportDate ? parsed.reportDate + 'T00:00:00Z' : at; // as-of time of this file's data
   const res = {file, reportDate:parsed.reportDate, total:parsed.rows.length, added:[], updated:[], delayed:[], unchanged:[], missing:[], duplicates:[],
     skipped:parsed.skipped, unknownHeaders:parsed.unknownHeaders, missingColumns:parsed.missingColumns};
   const seen = new Set();
@@ -802,7 +881,7 @@ function merge(parsed, file){
     seen.add(row.key);
     const ex = state.shipments[row.key];
     if (!ex){
-      state.shipments[row.key] = {key:row.key, fields:row.fields, extra:row.extra, archived:false, firstSeen:at, lastSeen:at,
+      state.shipments[row.key] = {key:row.key, fields:row.fields, extra:row.extra, archived:false, firstSeen:at, lastSeen:at, lastReport:reportAt,
         history:[{at, file, reportDate:parsed.reportDate, type:'added'}], review:{kinds:['new'], at, file, newFile:file}};
       res.added.push(row.key);
       continue;
@@ -810,7 +889,7 @@ function merge(parsed, file){
     // Columns missing from this file keep their previous values.
     for (const c of COLUMNS) if (!parsed.presentKeys.has(c.key) && c.key in ex.fields) row.fields[c.key] = ex.fields[c.key];
     const changes = diff(ex, row);
-    ex.lastSeen = at;
+    ex.lastSeen = at; ex.lastReport = reportAt;
     if (changes.length){
       ex.fields = row.fields; ex.extra = row.extra;
       ex.history.push({at, file, reportDate:parsed.reportDate, type:'updated', changes});
@@ -1161,7 +1240,10 @@ function popupHtml(d){
   const etaLine = d.stage === 'transit' && d.arr ? `ETA in ${plural(Math.max(0, Math.ceil((d.arr - now()) / 86400000)), 'day')}` : '';
   const v = d.vessel, fix = v && v.positionTime ? `AIS ${ago(v.positionTime)}` : '';
   let note = '';
-  if (d.posKind === 'ais') note = `Live AIS position, reported ${ago(v.positionTime)}${v.speedKn != null ? ' · ' + esc(v.speedKn) + ' kn' : ''}`;
+  const ev = d.lastEvent, evNote = d.stageSrc === 'event' ? `Container${ev.src === 'lookup' ? ' (carrier lookup)' : ''}: ${esc(EVENTS[ev.type].label)}${ev.place ? ', ' + esc(placeName(ev.place)) : ''}, ${ago(ev.at)}` : '';
+  if (d.posKind === 'event') note = `Position from the latest container event (${ago(ev.at)}${v && typeof v.lat === 'number' ? ', newer than AIS' : ''})`;
+  else if (d.posKind === 'ais') note = `Live AIS position, reported ${ago(v.positionTime)}${v.speedKn != null ? ' · ' + esc(v.speedKn) + ' kn' : ''}`;
+  else if (d.posKind === 'est-event') note = `Estimated position from the logged departure and ETA${fix ? ' · last ' + fix : ''}`;
   else if (d.posKind === 'est-ais') note = `Estimated position from AIS departure and ETA${fix ? ' · last ' + fix : ''}`;
   else if (d.posKind === 'est-schedule') note = `Estimated position from supplier ETD/ETA${fix ? ' · last ' + fix : ''}`;
   else if (v && v.found && !v.onVoyage) note = `Vessel now: ${v.status ? esc(v.status) + ', ' : ''}heading to ${esc(v.destination || '?')}${v.eta ? ', ETA ' + fmtStamp(v.eta) : ''}${fix ? ' · ' + fix : ''}`;
@@ -1177,8 +1259,12 @@ function popupHtml(d){
       <dt>${d.mode === 'air' ? 'Flight' : 'Vessel'}</dt><dd>${esc(d.vehicle || 'TBA')}${f.carrier && !blank(f.carrier) ? ' · ' + esc(f.carrier) : ''}</dd>
       <dt>Mode</dt><dd>${d.mode === 'air' ? 'Air' : 'Sea'}${f.volume && !blank(f.volume) ? ' · ' + esc(f.volume) : ''}</dd>
       <dt>Site expected</dt><dd>${dateHtml(d, 'siteExpected')}</dd>
+      ${d.eta && d.eta.src !== 'supplier' ? `<dt>Latest ETA</dt><dd>${fmtDate(isoDay(d.eta.eta))} <span class="muted">(${SRC_LABEL[d.eta.src]})</span></dd>` : ''}
       ${etaLine ? `<dt>Arrival</dt><dd>${etaLine}</dd>` : ''}
+      ${d.refs.booking.length ? `<dt>Booking</dt><dd>${esc(d.refs.booking.join(', '))}</dd>` : ''}
+      ${d.refs.containers.length ? `<dt>${d.refs.containers.length > 1 ? 'Containers' : 'Container'}</dt><dd>${esc(d.refs.containers.join(', '))}</dd>` : ''}
     </dl>
+    ${evNote ? `<p class="note">${evNote}</p>` : ''}
     ${note ? `<p class="note">${note}</p>` : ''}
     <button class="btn" data-action="detail" data-fla="${esc(d.key)}">Full details →</button>
   </div>`;
@@ -1223,7 +1309,8 @@ function groupsOf(list){
 function rowHtml(d){
   const sub = [`${esc(d.f.pol || '?')} → ${esc(d.f.pod || '?')}`, esc(d.vehicle || (d.mode === 'air' ? 'Air · flight TBA' : 'Vessel TBA'))].join(' · ');
   const side = d.s.archived ? `<span>Archived ${esc(fmtShort((d.s.archivedAt || '').slice(0,10)))}</span>` :
-    `<span class="chip st-${d.status}">${STAGES[d.status].label}</span><span>ETA ${dateHtml(d, 'eta', true)}</span>`;
+    `<span class="chip st-${d.status}">${STAGES[d.status].label}</span><span>ETA ${d.eta && d.eta.src !== 'supplier'
+      ? `<span title="Latest ETA, from ${SRC_LABEL[d.eta.src]}">${esc(fmtShort(isoDay(d.eta.eta)))}*</span>` : dateHtml(d, 'eta', true)}</span>`;
   const delayed = d.status === 'delayed' && !d.s.archived;
   return `<button class="row${ui.selected === d.key ? ' sel' : ''}${delayed ? ' delayed' : ''}${reviewKinds(d.s).length ? ' unread' : ''}" data-action="detail" data-fla="${esc(d.key)}"
     ${delayed ? `title="Delayed ${delayNote(d)} · ${STAGES[d.stage].label}"` : ''}>
@@ -1248,6 +1335,53 @@ function renderList(list){
       <button class="btn small" data-edit data-action="${archived ? 'restore-project' : 'archive-project'}" data-project="${esc(g.no)}"
         title="${archived ? 'Restore' : 'Archive'} every shipment in ${esc(g.no)}">${archived ? 'Restore all' : 'Archive all'}</button></div>
     ${g.items.map(rowHtml).join('')}</div>`).join('');
+}
+
+// Where each piece of information comes from (newest wins between supplier file, AIS and container events).
+function sourceLines(d){
+  const ev = d.lastEvent, v = d.vessel, out = [];
+  out.push(d.stageSrc === 'event' ? `Status: ${ev.src === 'lookup' ? 'carrier lookup' : 'container event'} "${esc(EVENTS[ev.type].label)}"${ev.place ? ' at ' + esc(placeName(ev.place)) : ''}, ${fmtStamp(ev.at)}`
+    : `Status: supplier file dates${isNaN(d.fileT) ? '' : ' (file of ' + fmtDate(isoDay(d.fileT)) + ')'}`);
+  if (d.posKind === 'event') out.push(`Position: container event at ${esc(placeName(ev.place))}, ${ago(ev.at)}${v && typeof v.lat === 'number' ? ' (newer than AIS)' : ''}`);
+  else if (d.posKind === 'ais') out.push(`Position: live AIS, ${ago(v.positionTime)}`);
+  else if (d.posKind && d.posKind.startsWith('est')) out.push(`Position: estimated from the ${d.timeSrc === 'event' ? 'logged departure' : d.timeSrc === 'ais' ? 'AIS departure' : 'supplier ETD'} and the ETA`);
+  else if (d.posKind === 'pod' || d.posKind === 'pol') out.push(`Position: ${d.posKind === 'pod' ? 'destination' : 'load'} port (from the status)`);
+  if (d.eta) out.push(`ETA ${fmtDate(isoDay(d.eta.eta))}: ${SRC_LABEL[d.eta.src]}${d.eta.src === 'supplier' ? '' : ', updated ' + fmtStamp(d.eta.at)}`);
+  return out;
+}
+// Booking & container tracking card: numbers (supplier file or edited), carrier links, sources, container event log.
+function containerCard(d){
+  const s = d.s, r = d.refs, site = trackSite(d), key = esc(d.key);
+  const track = n => `<span class="ref">${esc(n)} <button class="btn small" data-action="track-copy" data-num="${esc(n)}" data-url="${esc(site.url)}"
+    title="Copies ${esc(n)} and opens the ${esc(site.name)} tracking page: paste it there">Copy &amp; open ${esc(site.name)}</button></span>`;
+  const numbers = !TEAM && ui.editRefs === d.key ? `<form class="ev-form" data-form="refs" data-fla="${key}">
+      <label class="wide">Booking ref(s), comma separated<input class="fld" name="booking" value="${esc(r.booking.join(', '))}"></label>
+      <label class="wide">Container number(s), comma separated<input class="fld" name="containers" value="${esc(r.containers.join(', '))}"></label>
+      <div class="wide actions"><button class="btn primary small" type="submit">Save</button><button class="btn small" type="button" data-action="refs-cancel">Cancel</button>${
+        s.refs ? `<button class="btn small" type="button" data-action="refs-reset" data-fla="${key}">Use supplier file</button>` : ''}</div></form>`
+    : `<dl><dt>Booking</dt><dd>${r.booking.length ? r.booking.map(track).join('') : '—'}</dd>
+      <dt>${r.containers.length > 1 ? 'Containers' : 'Container'}</dt><dd>${r.containers.length ? r.containers.map(c => { const l = lookupOf(c);
+        return track(c) + (l ? `<div class="muted lookup">Looked up ${esc(fmtStamp(l.checkedAt))} on ${esc(l.source || 'the carrier site')}${l.vessel ? ' · now on ' + esc(l.vessel) : ''}${
+          isISO(l.eta) ? ' · ETA ' + esc(fmtDate(l.eta)) : ''}</div>` : ''); }).join('') : '—'}</dd></dl>
+      ${r.edited ? `<p class="note">Edited here. Supplier file: booking ${esc(splitRefs(d.f.bookingRef).join(', ') || 'blank')}, containers ${esc(d.f.containers || 'blank')}.</p>` : ''}
+      ${TEAM ? '' : `<button class="btn small" data-action="refs-edit" data-fla="${key}">Edit numbers</button>`}`;
+  const list = d.events.slice().reverse().map(e => `<li><span class="when">${fmtStamp(e.at)}</span> — ${esc(EVENTS[e.type].label)}${e.place ? ' · ' + esc(placeName(e.place)) : ''}${
+    e.container ? ' · ' + esc(e.container) : ''}${isISO(e.eta) ? ' · carrier ETA ' + esc(fmtDate(e.eta)) : ''}${e.note ? ' · ' + esc(e.note) : ''}${
+    e.src === 'lookup' ? ' <span class="muted">(carrier lookup)</span>' :
+    TEAM ? '' : ` <button class="x small-x" data-action="event-del" data-fla="${key}" data-i="${s.events.indexOf(e)}" title="Delete this event">×</button>`}</li>`).join('');
+  const nowLocal = new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const form = TEAM ? '' : `<form class="ev-form" data-form="event" data-fla="${key}">
+      <label class="wide">Log a container event<select class="fld" name="type">${Object.entries(EVENTS).map(([k, e]) => `<option value="${k}">${esc(e.label)}</option>`).join('')}</select></label>
+      <label>Port / place<input class="fld" name="place" list="portList" placeholder="e.g. Busan or KRPUS"></label>
+      <label>When<input class="fld" type="datetime-local" name="at" value="${nowLocal}" required></label>
+      ${r.containers.length > 1 ? `<label>Container<select class="fld" name="container"><option value="">All</option>${r.containers.map(c => `<option>${esc(c)}</option>`).join('')}</select></label>` : ''}
+      <label>Carrier ETA (optional)<input class="fld" type="date" name="eta"></label>
+      <label class="wide">Note (optional)<input class="fld" name="note"></label>
+      <div class="wide"><button class="btn primary small" type="submit">Log event</button></div>
+      <datalist id="portList">${Object.entries(PORTS).map(([c, p]) => `<option value="${c}">${esc(p.name)}</option>`).join('')}</datalist></form>`;
+  return `<section class="card"><h3>Booking &amp; container tracking</h3>${numbers}
+    <h4>Newest information</h4><ul class="hist">${sourceLines(d).map(x => `<li>${x}</li>`).join('')}</ul>
+    <h4>Container events</h4><ul class="hist">${list || '<li class="muted">None logged yet.</li>'}</ul>${form}</section>`;
 }
 
 function renderDetail(d){
@@ -1285,7 +1419,8 @@ function renderDetail(d){
 
   const hist = (s.history || []).slice().reverse().map(h => `<li><span class="when">${fmtStamp(h.at)}</span> — ${
     h.type === 'added' ? `added from ${esc(h.file)}` : h.type === 'archived' ? 'archived' : h.type === 'restored' ? 'restored from archive' :
-    h.type === 'type-set' ? `shipment type set to ${h.to ? TYPES[h.to].one : 'not set'}` : `updated from ${esc(h.file)}`}${
+    h.type === 'type-set' ? `shipment type set to ${h.to ? TYPES[h.to].one : 'not set'}` :
+    h.type === 'refs-set' ? (h.reset ? 'booking/container numbers set back to the supplier file' : 'booking/container numbers edited') : `updated from ${esc(h.file)}`}${
     h.changes ? `<ul>${h.changes.map(c => `<li>${esc(c.label)}: <del>${esc(isISO(c.from) ? fmtDate(c.from) : c.from || '(blank)')}</del> → ${esc(isISO(c.to) ? fmtDate(c.to) : c.to || '(blank)')}</li>`).join('')}</ul>` : ''}</li>`).join('');
 
   sbBody.innerHTML = `<div class="detail">
@@ -1310,9 +1445,11 @@ function renderDetail(d){
                    : `<button class="btn" data-edit data-action="archive" data-fla="${esc(d.key)}">Archive shipment</button>`}
     </div>
     <section class="card"><h3>Route</h3>${legHtml(d)}
-      ${d.posKind === 'ais' ? '<p class="note">Map position is the latest live AIS report.</p>' : d.posKind === 'est-ais' ? '<p class="note">Map position is estimated along the route from AIS departure and ETA.</p>' : d.posKind === 'est-schedule' ? '<p class="note">Map position is estimated from supplier ETD and ETA.</p>' : ''}
+      ${d.posKind === 'ais' ? '<p class="note">Map position is the latest live AIS report.</p>' : d.posKind === 'est-ais' ? '<p class="note">Map position is estimated along the route from AIS departure and ETA.</p>' : d.posKind === 'est-schedule' ? '<p class="note">Map position is estimated from supplier ETD and ETA.</p>' :
+        d.posKind === 'event' ? '<p class="note">Map position is the latest container event.</p>' : d.posKind === 'est-event' ? '<p class="note">Map position is estimated from the logged departure and the ETA.</p>' : ''}
       ${d.routeKind === 'schematic' || d.routeKind === 'air' ? '<p class="note">The route line is indicative, not the actual path.</p>' : ''}</section>
     ${vesselCard}
+    ${d.mode === 'sea' || d.refs.booking.length || d.refs.containers.length || d.events.length ? containerCard(d) : ''}
     <section class="card"><h3>Shipment details</h3><dl>${dl}</dl></section>
     <section class="card"><h3>History</h3><ul class="hist">${hist || '<li class="muted">No history.</li>'}</ul></section>
   </div>`;
@@ -1329,17 +1466,23 @@ function renderSidebar(list){
 }
 
 // ---------- Header & legend ----------
+// When the containers were last looked up on the carriers' tracking pages (container-tracking.js).
+function containerMeta(word = 'Container'){
+  const ct = window.CONTAINER_TRACKING;
+  return ct && ct.checkedAt ? `${word} data checked ${fmtStamp(ct.checkedAt)}` : `${word} data not checked yet`;
+}
 function renderMeta(){
   const last = state.imports[state.imports.length - 1];
   const tr = window.VESSEL_TRACKING;
   if (TEAM){
     document.getElementById('meta').innerHTML = teamPublishedAt
-      ? `Team view (read-only) · published <b>${fmtStamp(teamPublishedAt)}</b>${tr ? ' · vessel data checked ' + fmtStamp(tr.checkedAt) : ''}` : 'Team view (read-only)';
+      ? `Team view (read-only) · published <b>${fmtStamp(teamPublishedAt)}</b>${tr ? ' · vessel data checked ' + fmtStamp(tr.checkedAt) : ''} · ${containerMeta('container')}` : 'Team view (read-only)';
     return;
   }
   document.getElementById('meta').innerHTML = [
     last ? `Last import: <b>${esc(last.file)}</b>${last.reportDate ? ' (supplier report ' + fmtDate(last.reportDate) + ')' : ''}, ${fmtStamp(last.at)}` : 'No supplier file imported yet',
     tr ? `Vessel data checked ${fmtStamp(tr.checkedAt)}` : 'No vessel tracking file (tracking.js) found',
+    containerMeta(),
     cloudNote(),
   ].filter(Boolean).join(' · ');
 }
@@ -1363,6 +1506,9 @@ function renderTypeControls(all){
     Object.entries(TYPES).map(([k, t]) => `<option value="${k}">${t.label} (${n(k)})</option>`).join('');
   sel.value = ui.type;
 }
+
+// Background redraws (timer, new AIS data) skip while a form in the details is being filled in, so typing isn't lost.
+function renderQuiet(){ const el = document.activeElement; if (el && el.closest && el.closest('#sbBody form')) return; render(); }
 
 function render(){
   const all = Object.values(state.shipments).map(derive);
@@ -1394,7 +1540,8 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-action]');
   if (!el) return;
   const a = el.dataset.action, key = el.dataset.fla;
-  if (TEAM && ['import', 'export', 'archive', 'restore', 'archive-project', 'restore-project', 'ais-refresh', 'publish', 'publish-go'].includes(a)) return; // read-only
+  if (TEAM && ['import', 'export', 'archive', 'restore', 'archive-project', 'restore-project', 'ais-refresh', 'ctr-refresh', 'publish', 'publish-go',
+    'refs-edit', 'refs-reset', 'event-del'].includes(a)) return; // read-only
   switch (a){
     case 'import': fileInput.click(); break;
     case 'export': exportBackup(); break;
@@ -1422,6 +1569,7 @@ document.addEventListener('click', e => {
     case 'close-popup': if (map) map.closePopup(); break;
     case 'close-dialog': dlg.close(); break;
     case 'ais-refresh': aisClick(); break;
+    case 'ctr-refresh': ctrClick(); break;
     case 'boat-hide': boatHidden = true; showBoat(false); break;
     case 'publish': publishDialog(); break;
     case 'publish-go': publishGo(el); break;
@@ -1430,7 +1578,46 @@ document.addEventListener('click', e => {
       for (const sel of dlg.querySelectorAll('select[data-pick]')) if (sel.value) setType(sel.dataset.pick, sel.value);
       save(); render(); dlg.close(); break;
     case 'types-later': dlg.close(); break;
+    case 'track-copy': { // copy the number, open the carrier's tracking page (the number is pasted there, never sent by the dashboard)
+      if (navigator.clipboard) navigator.clipboard.writeText(el.dataset.num).catch(() => {});
+      window.open(el.dataset.url, '_blank', 'noopener');
+      const label = el.textContent; el.textContent = 'Copied: paste it there'; setTimeout(() => { el.textContent = label; }, 2500);
+      break;
+    }
+    case 'refs-edit': ui.editRefs = key; render(); break;
+    case 'refs-cancel': ui.editRefs = null; render(); break;
+    case 'refs-reset': {
+      const s = state.shipments[key]; if (!s) break;
+      delete s.refs; s.history.push({at:new Date().toISOString(), type:'refs-set', reset:true});
+      ui.editRefs = null; save(); render(); break;
+    }
+    case 'event-del': {
+      const s = state.shipments[key], i = +el.dataset.i;
+      if (s && s.events && s.events[i] && confirm('Delete this container event?')){ s.events.splice(i, 1); save(); render(); }
+      break;
+    }
   }
+});
+// Forms in the details: edit booking/container numbers, log a container event.
+document.addEventListener('submit', e => {
+  const form = e.target.closest('form[data-form]');
+  if (!form) return;
+  e.preventDefault();
+  const s = state.shipments[form.dataset.fla], v = Object.fromEntries(new FormData(form)), at = new Date().toISOString();
+  if (TEAM || !s) return;
+  if (form.dataset.form === 'refs'){
+    const booking = splitRefs(v.booking).join(', '), containers = refsOf({fields:{containers:v.containers}}).containers.join(', ');
+    const file = refsOf({fields:s.fields});
+    if (booking === file.booking.join(', ') && containers === file.containers.join(', ')) delete s.refs; // same as the file: no edit
+    else s.refs = {booking, containers};
+    s.history.push({at, type:'refs-set'}); ui.editRefs = null;
+  } else if (form.dataset.form === 'event'){
+    const when = new Date(v.at);
+    if (isNaN(when)) return;
+    (s.events ||= []).push({type:v.type, place:String(v.place || '').trim(), at:when.toISOString(), container:v.container || '',
+      eta:v.eta || '', note:String(v.note || '').trim(), src:'manual', logged:at});
+  }
+  save(); render();
 });
 document.addEventListener('change', e => {
   const el = e.target;
@@ -1477,14 +1664,50 @@ function reloadTracking(){
     document.head.appendChild(s);
   });
 }
+// ---------- Refresh containers: a request the scheduled Claude task picks up (every 30 min, weekdays 7am-6pm, while the Claude app is open) ----------
+const ctrBtn = document.getElementById('ctrBtn');
+let ctrSavedAt = null;
+function reloadContainers(){
+  return new Promise(resolve => {
+    const s = document.createElement('script');
+    s.src = 'container-tracking.js?t=' + Date.now();
+    s.onload = s.onerror = () => { s.remove(); resolve(); };
+    document.head.appendChild(s);
+  });
+}
+async function containerTick(ct){
+  if (ct.savedAt && ct.savedAt !== ctrSavedAt){ // new lookup results: load them and redraw
+    const first = ctrSavedAt === null; ctrSavedAt = ct.savedAt;
+    if (!first){ await reloadContainers(); renderQuiet(); }
+  }
+  const last = window.CONTAINER_TRACKING;
+  const lastLine = last && last.checkedAt ? `Last container lookup ${fmtStamp(last.checkedAt)}${last.note ? ': ' + String(last.note).replace(/\.$/, '') : ''}.` : 'No container lookup yet.';
+  ctrBtn.textContent = ct.requestedAt ? 'Containers requested' : 'Refresh containers';
+  ctrBtn.title = ct.requestedAt
+    ? `Requested ${fmtStamp(ct.requestedAt)}. Claude looks the containers up within 30 minutes on weekdays, 7am to 6pm, while the Claude app is open. ${lastLine}`
+    : `Ask Claude to look up the containers on the carriers' tracking pages (container numbers only). ${lastLine}`;
+}
+async function ctrClick(){
+  if (!viaHelper) return showDialog(`<h2>Refresh containers needs the Shipping Dashboard app</h2><p>Open the dashboard with the <b>Shipping Dashboard</b> shortcut on your desktop.</p>`);
+  const n = new Set(Object.values(state.shipments).filter(s => !s.archived).flatMap(s => refsOf(s).containers.filter(c => /^[A-Z]{4}\d{7}$/.test(c)))).size;
+  if (!n) return showDialog(`<h2>No container numbers to check yet</h2><p>Container numbers come from the supplier file's container column, or you can add them in a shipment's details under <b>Booking &amp; container tracking</b>.</p>`);
+  ctrBtn.disabled = true;
+  lastContainerList = ''; await postContainerList(); // the list Claude checks is this window's (another browser/tab may have saved its own)
+  try { await containerTick(await (await fetch('/api/containers/refresh', {method:'POST'})).json()); }
+  catch (e) { ctrBtn.title = `Couldn't reach the app (${e.message}).`; }
+  finally { ctrBtn.disabled = false; }
+  showDialog(`<h2>Container refresh requested</h2><p>Claude will look up ${plural(n, 'container')} on the carriers' tracking pages (container numbers only) within 30 minutes on weekdays, 7am to 6pm, while the Claude app is open. The dashboard updates by itself when the results arrive.</p>`);
+}
+
 async function aisTick(){
   let st;
   try { st = await api('/api/status'); }
   catch { clearInterval(aisPoll); aisPoll = null; showBoat(false); aisBtn.textContent = 'Refresh positions'; aisStatus.textContent = 'The Shipping Dashboard app isn\'t running. Start it from the desktop shortcut.'; return; }
+  if (st.containers) containerTick(st.containers);
   const savedAt = st.running ? st.savedAt : st.last && st.last.savedAt;
   if (savedAt && savedAt !== aisSavedAt){
     aisSavedAt = savedAt;
-    if (!aisFirstTick){ await reloadTracking(); render(); } // on page load the latest file is already in
+    if (!aisFirstTick){ await reloadTracking(); renderQuiet(); } // on page load the latest file is already in
   }
   aisFirstTick = false;
   if (st.running){
@@ -1549,6 +1772,7 @@ if (TEAM){
     const snap = await decryptTeam(pkg, password); // wrong password -> OperationError
     state = snap.state || emptyState();
     window.VESSEL_TRACKING = snap.tracking || undefined;
+    window.CONTAINER_TRACKING = snap.containers || undefined;
     teamPublishedAt = snap.publishedAt; teamPkgId = pkg.iv; teamPassword = password;
     render();
   };
@@ -1618,7 +1842,7 @@ async function publishGo(btn){
         tracking = newerTracking(tracking, (await decryptTeam(live, pw)).tracking);
       }
     } catch {} // first publish, a new password or offline: publish what this PC has
-    const pkg = await encryptTeam({publishedAt:new Date().toISOString(), state, tracking}, pw);
+    const pkg = await encryptTeam({publishedAt:new Date().toISOString(), state, tracking, containers:window.CONTAINER_TRACKING || null}, pw);
     let page = await (await fetch('/', {cache:'no-store'})).text();
     // Closing script tags are written as <\/script> so the HTML parser doesn't end this inline script early.
     page = page.replace('<head>', '<head>\n<meta name="robots" content="noindex">\n<script>window.TEAM_VIEW = true;<\/script>')
@@ -1657,7 +1881,7 @@ async function syncCloud(){
         const saved = await (await fetch('/api/tracking', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(merged)})).json();
         if (!saved.ok) return; // e.g. a refresh started meanwhile - try again next time
         window.VESSEL_TRACKING = merged;
-        if (!map || !map._popup || !map.hasLayer(map._popup)) render();
+        if (!map || !map._popup || !map.hasLayer(map._popup)) renderQuiet();
       }
       cloudSync.iv = pkg.iv;
     }
@@ -1678,10 +1902,26 @@ addEventListener('dragleave', e => { if (!hasFiles(e)) return; if (--dragDepth <
 addEventListener('drop', e => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth = 0; drop.hidden = true; importFile(e.dataTransfer.files[0]); });
 
 // Re-draw every 10 minutes so in-transit positions keep moving (skipped while a pop-out is open).
-setInterval(() => { if (!map || !map._popup || !map.hasLayer(map._popup)) render(); }, 10 * 60 * 1000);
+setInterval(() => { if (!map || !map._popup || !map.hasLayer(map._popup)) renderQuiet(); }, 10 * 60 * 1000);
+
+// The app keeps the container numbers to check (container-list.json: number, carrier, vessel only) so Claude can look them up
+// on carrier sites when asked to "update containers". Sent again only when the list changes.
+let lastContainerList = '';
+function postContainerList(){
+  if (!viaHelper || TEAM) return;
+  const seen = new Set(), containers = [];
+  for (const s of Object.values(state.shipments)) if (!s.archived)
+    for (const c of refsOf(s).containers) if (/^[A-Z]{4}\d{7}$/.test(c) && !seen.has(c)){
+      seen.add(c); containers.push({container:c, carrier:String(s.fields.carrier || ''), vessel:String(s.fields.vessel || '')});
+    }
+  const body = JSON.stringify({containers});
+  if (body === lastContainerList) return Promise.resolve();
+  lastContainerList = body;
+  return fetch('/api/containers', {method:'POST', headers:{'Content-Type':'application/json'}, body}).catch(() => { lastContainerList = ''; });
+}
 
 window.ShippingDashboard = {importFile, render, syncCloud, state: () => state, map: () => map}; // for troubleshooting from the console
-if (!TEAM) migrateTypes();
+if (!TEAM){ migrateTypes(); postContainerList(); }
 render();
 })();
 </script>

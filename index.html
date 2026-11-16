@@ -295,7 +295,8 @@ dialog::backdrop{background:rgba(0,0,0,.35)}
   <div class="meta" id="meta"></div>
   <span class="ais-status" id="aisStatus" aria-live="polite" data-edit></span>
   <button class="btn" id="aisBtn" data-action="ais-refresh" data-edit title="Pull live ship positions from AISStream (up to 10 min; positions appear as ships report)">Refresh positions</button>
-  <button class="btn" id="ctrBtn" data-action="ctr-refresh" data-edit title="Ask Claude to look up the containers on the carriers' tracking pages">Refresh containers</button>
+  <!-- Hidden while the scheduled container-refresh task is paused (user, 2026-11-11): remove "hidden" to bring it back. -->
+  <button class="btn" id="ctrBtn" data-action="ctr-refresh" data-edit hidden title="Ask Claude to look up the containers on the carriers' tracking pages">Refresh containers</button>
   <button class="btn primary" data-action="import" data-edit title="Import a supplier PROJECT DETAILS file (.xlsx) or a dashboard backup (.json)">Import file</button>
   <button class="btn" data-action="export" data-edit title="Save all shipments, archive and history to a .json backup file">Export backup</button>
   <button class="btn" id="publishBtn" data-action="publish" data-edit hidden title="Encrypt everything with the team password and publish it to the team's GitHub Pages link">Publish team view</button>
